@@ -1,0 +1,10 @@
+// Copyright 2024 Nikos Leivadaris <nikosleiv@gmail.com>.
+// SPDX-License-Identifier: GPL-2.0
+
+dir     /bin                                          0755 0 0
+file    /bin/busybox  busybox                         0755 0 0
+slink   /bin/sh       /bin/busybox                    0755 0 0
+file    /init         init.sh                         0755 0 0
+
+file    /edudev.ko   ../src/edudev.ko   0755 0 0
+file    /bin/educli   ../src/cli/educli   0755 0 0

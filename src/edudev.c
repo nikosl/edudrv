@@ -1,3 +1,9 @@
+/*
+ * Copyright 2024 Nikos Leivadaris <nikosleiv@gmail.com>.
+ * SPDX-License-Identifier: GPL-2.0
+ */
+
+#include <linux/mutex.h>
 #include <linux/dma-direction.h>
 #include <linux/gfp_types.h>
 #include <linux/wait.h>
@@ -21,6 +27,8 @@
 
 #define EDU_PCI_VENDOR_ID 0x1234
 #define EDU_PCI_DEVICE_ID 0x11e8
+
+#define EDU_MAX_DEVICES 4
 
 #define EDU_DMA_MASK 28
 #define EDU_DMA_SIZE 4096
@@ -77,26 +85,27 @@ struct edu_data {
 	dma_addr_t dma_handle;
 };
 
-struct edu_procfs {
-	struct proc_dir_entry *proc_dir;
-	struct proc_dir_entry *proc_version;
-};
-
 struct edu_device {
-	struct class *class;
-	struct device *device;
-};
-
-struct edu_module {
+	int id;
+	dev_t nod;
 	int irq;
-	dev_t major;
 	struct cdev cdev;
+	struct class *class;
 	wait_queue_head_t wq;
 
 	struct edu_data data;
-	struct edu_device dev;
+	struct device *device;
 	struct pci_dev *pdev;
 };
+
+struct edu_module {
+	dev_t major;
+	int cnt;
+	struct class *class;
+	struct edu_device *devices[EDU_MAX_DEVICES];
+};
+
+static struct mutex edu_mutex;
 
 static struct edu_module *edu_mod = NULL;
 
@@ -105,10 +114,18 @@ static struct pci_device_id edu_pci_tbl[] = { { PCI_DEVICE(EDU_PCI_VENDOR_ID,
 					      { 0 } };
 MODULE_DEVICE_TABLE(pci, edu_pci_tbl);
 
-static int edu_module_init(struct edu_module *mod)
+static void edu_module_init(struct edu_module *mod)
+{
+	mod->major = 0;
+	mod->cnt = 0;
+	mod->class = NULL;
+
+	memset(&mod->devices, 0, sizeof(mod->devices));
+}
+
+static int edu_device_init(struct edu_device *mod)
 {
 	mod->irq = 0;
-	mod->major = 0;
 
 	init_waitqueue_head(&mod->wq);
 
@@ -184,21 +201,19 @@ static inline bool edu_mmio_is_xfer_active(const struct edu_data *data)
 	       EDU_DMA_CMD_START_XFER;
 }
 
-static int edu_mmio_init_dma(struct edu_module *mod, void *buffer, u32 count,
+static int edu_mmio_init_dma(struct edu_device *dev, void *buffer, u32 count,
 			     enum dma_data_direction dir)
 {
 	if (count > EDU_DMA_SIZE) {
 		return -EINVAL;
 	}
 
-	struct edu_data *data = &mod->data;
+	struct edu_data *data = &dev->data;
 	if (edu_mmio_is_xfer_active(data)) {
 		return -EBUSY;
 	}
 
-	dma_addr_t addr = EDU_DMA_OFFSET;
-
-	dma_addr_t buf_dma = mod->data.dma_handle;
+	dma_addr_t buf_dma = dev->data.dma_handle;
 	// 	dma_map_single(&mod->pdev->dev, buffer, count, dir);
 	// int rc = dma_mapping_error(&mod->pdev->dev, buf_dma);
 	// if (unlikely(rc)) {
@@ -207,28 +222,33 @@ static int edu_mmio_init_dma(struct edu_module *mod, void *buffer, u32 count,
 
 	pr_info("edudev: dma map single 0x%08x\n", buf_dma);
 
+	u32 cmd = 0;
+	dma_addr_t src = 0;
+	dma_addr_t dst = 0;
+
 	switch (dir) {
 	case DMA_TO_DEVICE: {
-		iowrite32(buf_dma, data->iomem + EDU_ADDR_DMA_SRC);
-		iowrite32(addr, data->iomem + EDU_ADDR_DMA_DST);
-		iowrite32(count, data->iomem + EDU_ADDR_DMA_COUNT);
-		iowrite32(EDU_DMA_CMD_XFER_TO_DEV,
-			  data->iomem + EDU_ADDR_DMA_CMD);
+		src = buf_dma;
+		dst = EDU_DMA_OFFSET;
+		cmd = EDU_DMA_CMD_XFER_TO_DEV;
 		break;
 	}
 	case DMA_FROM_DEVICE: {
-		iowrite32(addr, data->iomem + EDU_ADDR_DMA_SRC);
-		iowrite32(buf_dma, data->iomem + EDU_ADDR_DMA_DST);
-		iowrite32(count, data->iomem + EDU_ADDR_DMA_COUNT);
-		iowrite32(EDU_DMA_CMD_XFER_TO_RAM,
-			  data->iomem + EDU_ADDR_DMA_CMD);
+		src = EDU_DMA_OFFSET;
+		dst = buf_dma;
+		cmd = EDU_DMA_CMD_XFER_TO_RAM;
 		break;
 	}
 	default:
 		return -EINVAL;
 	}
 
-	wait_event_interruptible(edu_mod->wq, !edu_mmio_is_xfer_active(data));
+	iowrite32(src, data->iomem + EDU_ADDR_DMA_SRC);
+	iowrite32(dst, data->iomem + EDU_ADDR_DMA_DST);
+	iowrite32(count, data->iomem + EDU_ADDR_DMA_COUNT);
+	iowrite32(cmd, data->iomem + EDU_ADDR_DMA_CMD);
+
+	wait_event_interruptible(dev->wq, !edu_mmio_is_xfer_active(data));
 
 	// dma_unmap_single(&mod->pdev->dev, buf_dma, count, dir);
 
@@ -239,24 +259,31 @@ static irqreturn_t edu_irq_handler(int irq, void *dev_id)
 {
 	pr_info("edudev: irq interrupt received\n");
 
-	struct edu_data *data = (struct edu_data *)dev_id;
+	struct edu_device *dev = (struct edu_device *)dev_id;
+	struct edu_data *data = &dev->data;
 
 	unsigned int intr = edu_mmio_irq_status(data);
 	pr_info("edudev: irq status %d\n", intr);
 
 	edu_mmio_irq_ack(data, intr);
 
-	wake_up_interruptible(&edu_mod->wq);
+	wake_up_interruptible(&dev->wq);
 
 	return IRQ_HANDLED;
 }
 
 static int edu_open(struct inode *in, struct file *f)
 {
-	nonseekable_open(in, f);
-	struct edu_module *mod =
-		container_of(in->i_cdev, struct edu_module, cdev);
-	f->private_data = mod;
+	unsigned int idx = iminor(in);
+	if (idx >= EDU_MAX_DEVICES) {
+		return -ENODEV;
+	}
+
+	mutex_lock(&edu_mutex);
+	struct edu_device *dev = edu_mod->devices[idx];
+	mutex_unlock(&edu_mutex);
+
+	f->private_data = dev;
 
 	return 0;
 }
@@ -268,7 +295,7 @@ static ssize_t edu_write(struct file *f, const char __user *buf, size_t count,
 		return -EINVAL;
 	}
 
-	struct edu_module *mod = (struct edu_module *)f->private_data;
+	struct edu_device *dev = (struct edu_device *)f->private_data;
 
 	struct edu_stats *st = (struct edu_stats *)kmalloc(
 		sizeof(struct edu_stats), GFP_ATOMIC);
@@ -276,13 +303,13 @@ static ssize_t edu_write(struct file *f, const char __user *buf, size_t count,
 		return -ENOMEM;
 	}
 
-	edu_mmio_init_dma(mod, st, count, DMA_FROM_DEVICE);
+	edu_mmio_init_dma(dev, st, count, DMA_FROM_DEVICE);
 
 	pr_info("edudev: dma writes %d\n", st->writes);
 
 	st->writes += 1;
 
-	edu_mmio_init_dma(mod, st, count, DMA_TO_DEVICE);
+	edu_mmio_init_dma(dev, st, count, DMA_TO_DEVICE);
 
 	kfree(st);
 
@@ -297,7 +324,7 @@ static ssize_t edu_read(struct file *f, char __user *buf, size_t count,
 		return -EINVAL;
 	}
 
-	struct edu_module *mod = (struct edu_module *)f->private_data;
+	struct edu_device *dev = (struct edu_device *)f->private_data;
 
 	// struct edu_stats *st = (struct edu_stats *)kmalloc(
 	// 	sizeof(struct edu_stats), GFP_ATOMIC);
@@ -305,14 +332,14 @@ static ssize_t edu_read(struct file *f, char __user *buf, size_t count,
 	// 	return -ENOMEM;
 	// }
 
-	struct edu_stats *st = (struct edu_stats *)edu_mod->data.dma;
-	edu_mmio_init_dma(mod, st, sizeof(struct edu_stats), DMA_FROM_DEVICE);
+	struct edu_stats *st = (struct edu_stats *)dev->data.dma;
+	edu_mmio_init_dma(dev, st, sizeof(struct edu_stats), DMA_FROM_DEVICE);
 
 	pr_info("edudev: dma read %d\n", st->reads);
 
 	st->reads += 1;
 
-	edu_mmio_init_dma(mod, st, sizeof(struct edu_stats), DMA_TO_DEVICE);
+	edu_mmio_init_dma(dev, st, sizeof(struct edu_stats), DMA_TO_DEVICE);
 
 	// kfree(st);
 
@@ -320,10 +347,10 @@ static ssize_t edu_read(struct file *f, char __user *buf, size_t count,
 	return 0;
 }
 
-static long int edu_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+static long edu_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
-	struct edu_module *mod = (struct edu_module *)f->private_data;
-	struct edu_data *data = &mod->data;
+	struct edu_device *dev = (struct edu_device *)f->private_data;
+	struct edu_data *data = &dev->data;
 
 	u32 val = 0;
 
@@ -349,7 +376,7 @@ static long int edu_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		edu_mmio_set_factorial(data, val);
 
 		edu_mmio_expect_irq(data);
-		wait_event_interruptible(mod->wq, !edu_mmio_is_computing(data));
+		wait_event_interruptible(dev->wq, !edu_mmio_is_computing(data));
 
 		val = edu_mmio_get_factorial(data);
 
@@ -459,73 +486,62 @@ static struct file_operations edu_fops = {
 	.unlocked_ioctl = edu_ioctl,
 };
 
-static int edu_cdev_init(struct edu_module *dev)
+static int edu_cdev_init(struct edu_device *dev, struct class *cls, dev_t major,
+			 int idx)
 {
 	int rc = 0;
 
-	rc = alloc_chrdev_region(&dev->major, 0, 1, "edu");
-	if (rc < 0) {
-		pr_err("alloc_chrdev_region failed\n");
-		return rc;
-	}
+	dev->id = idx;
+	dev->nod = MKDEV(major, idx);
+	dev->class = cls;
 
 	cdev_init(&dev->cdev, &edu_fops);
 	dev->cdev.owner = THIS_MODULE;
 
-	rc = cdev_add(&dev->cdev, dev->major, 1);
+	rc = cdev_add(&dev->cdev, dev->nod, 1);
 	if (rc < 0) {
 		pr_err("cdev_add failed\n");
 		return rc;
 	}
 
-	return 0;
-}
-
-static void edu_cdev_remove(struct edu_module *dev)
-{
-	cdev_del(&dev->cdev);
-	unregister_chrdev_region(dev->major, 1);
-}
-
-static int edu_dev_init(struct edu_module *mod)
-{
-	int rc = 0;
-	struct edu_device *dev = &mod->dev;
-	struct edu_data *data = &mod->data;
-
-	dev->class = class_create(KBUILD_MODNAME);
-	if (IS_ERR(dev->class)) {
-		pr_err("class_create failed\n");
-		rc = (int)PTR_ERR(dev->class);
-		return rc;
-	}
-	dev->class->dev_groups = edu_groups;
-	dev->class->dev_uevent = edu_uevent;
-
 	dev->device =
-		device_create(dev->class, NULL, mod->major, data, "edu%d", 0);
+		device_create(cls, NULL, dev->nod, &dev->data, "edu%d", idx);
 	if (IS_ERR(dev->device)) {
 		pr_err("device_create failed\n");
 		rc = (int)PTR_ERR(dev->device);
-		goto class_cleanup;
+		goto cdev_cleanup;
 	}
 
 	return 0;
 
-class_cleanup:
-	class_destroy(dev->class);
+cdev_cleanup:
+	cdev_del(&dev->cdev);
 	return rc;
 }
 
-static void edu_dev_cleanup(struct edu_module *mod)
+static void edu_cdev_remove(struct edu_device *dev)
 {
-	struct edu_device *dev = &mod->dev;
-
-	device_destroy(dev->class, MKDEV(mod->major, 0));
-	class_destroy(dev->class);
+	cdev_del(&dev->cdev);
+	device_destroy(dev->class, dev->nod);
 }
 
-static int edu_driver_probe(struct pci_dev *dev,
+static int edu_class_init(struct edu_module *mod)
+{
+	int rc = 0;
+
+	mod->class = class_create(KBUILD_MODNAME);
+	if (IS_ERR(mod->class)) {
+		pr_err("class_create failed\n");
+		rc = (int)PTR_ERR(mod->class);
+		return rc;
+	}
+	mod->class->dev_groups = edu_groups;
+	mod->class->dev_uevent = edu_uevent;
+
+	return 0;
+}
+
+static int edu_driver_probe(struct pci_dev *pdev,
 			    const struct pci_device_id *dev_id)
 {
 	pr_info("edudev: probe\n");
@@ -533,100 +549,110 @@ static int edu_driver_probe(struct pci_dev *dev,
 	int rc = 0;
 	int irq_nr = 0;
 
-	rc = pcim_enable_device(dev);
+	rc = pcim_enable_device(pdev);
 	if (rc < 0) {
 		pr_err("pci_enable_device failed\n");
 		return rc;
 	}
 
-	edu_mod = devm_kzalloc(&dev->dev, sizeof(*edu_mod), GFP_KERNEL);
-	if (!edu_mod) {
+	struct edu_device *dev =
+		devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
+	if (!dev) {
 		return -ENOMEM;
 	}
 
-	edu_module_init(edu_mod);
+	edu_device_init(dev);
+	pci_set_drvdata(pdev, dev);
 
-	pci_set_master(dev);
+	pci_set_master(pdev);
 
-	rc = pcim_iomap_regions(dev, BIT(0), KBUILD_MODNAME);
+	rc = pcim_iomap_regions(pdev, BIT(0), KBUILD_MODNAME);
 	if (rc < 0) {
 		pr_err("pci request region failed\n");
 		return rc;
 	}
 
-	edu_mod->pdev = dev;
+	dev->pdev = pdev;
 
-	edu_mod->data.iomem = pcim_iomap_table(dev)[0];
+	dev->data.iomem = pcim_iomap_table(pdev)[0];
 
-	dma_set_mask_and_coherent(&(dev->dev), DMA_BIT_MASK(EDU_DMA_MASK));
-	edu_mod->data.dma = dmam_alloc_coherent(
-		&dev->dev, EDU_DMA_SIZE, &edu_mod->data.dma_handle, GFP_KERNEL);
+	dma_set_mask_and_coherent(&(pdev->dev), DMA_BIT_MASK(EDU_DMA_MASK));
+	dev->data.dma = dmam_alloc_coherent(&pdev->dev, EDU_DMA_SIZE,
+					    &dev->data.dma_handle, GFP_KERNEL);
 
-	if (!edu_mod->data.dma) {
-		pci_err(dev, "dmam_alloc_coherent failed\n");
+	if (!dev->data.dma) {
+		pci_err(pdev, "dmam_alloc_coherent failed\n");
 		return -ENOMEM;
 	}
 
-	rc = pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_ALL_TYPES);
+	rc = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_ALL_TYPES);
 	if (rc < 0) {
-		pci_err(dev, "pci_alloc_irq_vectors failed\n");
+		pci_err(pdev, "pci_alloc_irq_vectors failed\n");
 		return rc;
 	}
 
-	irq_nr = pci_irq_vector(dev, 0);
+	irq_nr = pci_irq_vector(pdev, 0);
 	if (irq_nr < 0) {
-		pci_err(dev, "pci_irq_vector failed\n");
+		pci_err(pdev, "pci_irq_vector failed\n");
 		rc = irq_nr;
 
 		goto free_irq_vec;
 	}
 
-	edu_mod->irq = irq_nr;
-	rc = request_irq(irq_nr, edu_irq_handler, 0, KBUILD_MODNAME,
-			 &edu_mod->data);
+	dev->irq = irq_nr;
+	rc = request_irq(irq_nr, edu_irq_handler, 0, KBUILD_MODNAME, dev);
 	if (rc < 0) {
-		pci_err(dev, "devm_request_irq failed\n");
+		pci_err(pdev, "devm_request_irq failed\n");
 		goto free_irq_vec;
 	}
 
-	rc = edu_cdev_init(edu_mod);
-	if (rc < 0) {
-		pr_err("edu_dev_init failed\n");
+	mutex_lock(&edu_mutex);
+	if (edu_mod->cnt >= EDU_MAX_DEVICES) {
+		pr_err("edu_dev_init %d failed\n", edu_mod->cnt);
+		rc = -EINVAL;
 		goto irq_cleanup;
 	}
 
-	rc = edu_dev_init(edu_mod);
+	rc = edu_cdev_init(dev, edu_mod->class, edu_mod->major, edu_mod->cnt);
 	if (rc < 0) {
-		pr_err("edu_dev_init failed\n");
-		goto cdev_cleanup;
+		pr_err("edu_dev_init %d failed\n", edu_mod->cnt);
+		goto irq_cleanup;
 	}
+
+	edu_mod->devices[edu_mod->cnt] = dev;
+	edu_mod->cnt += 1;
+	mutex_unlock(&edu_mutex);
 
 	return 0;
 
-cdev_cleanup:
-	edu_cdev_remove(edu_mod);
 irq_cleanup:
-	free_irq(irq_nr, edu_mod);
+	mutex_unlock(&edu_mutex);
+	free_irq(irq_nr, dev);
 free_irq_vec:
-	pci_free_irq_vectors(dev);
-	devm_kfree(&dev->dev, edu_mod);
+	pci_free_irq_vectors(pdev);
+	devm_kfree(&pdev->dev, dev);
 
 	return rc;
 }
 
-static void edu_driver_remove(struct pci_dev *dev)
+static void edu_driver_remove(struct pci_dev *pdev)
 {
 	pr_info("edudev: cleanup\n");
 
-	pr_info("cleanup dev\n");
-	edu_dev_cleanup(edu_mod);
+	struct edu_device *dev = pci_get_drvdata(pdev);
+	int id = dev->id;
 
 	pr_info("edudev: remove\n");
-	edu_cdev_remove(edu_mod);
+	edu_cdev_remove(dev);
 
 	pr_info("free irq\n");
-	free_irq(edu_mod->irq, &edu_mod->data);
-	pci_free_irq_vectors(dev);
+	free_irq(dev->irq, dev);
+	pci_free_irq_vectors(pdev);
+
+	mutex_lock(&edu_mutex);
+	// TODO: edu_mod->cnt -= 1;
+	edu_mod->devices[id] = NULL;
+	mutex_unlock(&edu_mutex);
 }
 
 static struct pci_driver edu_driver = {
@@ -639,15 +665,45 @@ static struct pci_driver edu_driver = {
 static int __init edu_init(void)
 {
 	pr_info("Edu module loaded.");
+
 	int rc = 0;
 
-	rc = alloc_chrdev_region(&edu_mod->major, 0, 1, "edu");
+	edu_mod = kzalloc(sizeof(*edu_mod), GFP_KERNEL);
+	edu_module_init(edu_mod);
+
+	mutex_init(&edu_mutex);
+
+	dev_t mjr = 0;
+
+	rc = alloc_chrdev_region(&mjr, 0, EDU_MAX_DEVICES, "edu");
 	if (rc < 0) {
 		pr_err("alloc_chrdev_region failed\n");
-		return rc;
+		goto free_alloc;
 	}
 
-	return pci_register_driver(&edu_driver);
+	edu_mod->major = MAJOR(mjr);
+
+	rc = edu_class_init(edu_mod);
+	if (rc < 0) {
+		pr_err("edu_class_init failed\n");
+		goto unregister_chrdev;
+	}
+
+	rc = pci_register_driver(&edu_driver);
+	if (rc < 0) {
+		pr_err("pci_register_driver failed\n");
+		goto remove_class;
+	}
+
+	return rc;
+
+remove_class:
+	class_destroy(edu_mod->class);
+unregister_chrdev:
+	unregister_chrdev_region(edu_mod->major, EDU_MAX_DEVICES);
+free_alloc:
+	kfree(edu_mod);
+	return rc;
 }
 
 static void __exit edu_exit(void)
@@ -655,12 +711,13 @@ static void __exit edu_exit(void)
 	pr_info("Edu module exit...");
 	pci_unregister_driver(&edu_driver);
 	unregister_chrdev_region(edu_mod->major, EDU_MAX_DEVICES);
+	class_destroy(edu_mod->class);
 	kfree(edu_mod);
 }
 
 module_init(edu_init);
 module_exit(edu_exit);
 
-MODULE_AUTHOR("N3kr4");
+MODULE_AUTHOR("Nikos Leivadaris <nikosleiv@gmail.com>");
 MODULE_DESCRIPTION("EDU driver");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL-2.0");

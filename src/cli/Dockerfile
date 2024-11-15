@@ -1,0 +1,6 @@
+FROM alpine:3.20
+
+RUN apk update \
+    && apk upgrade --no-cache \
+    && apk add --no-cache build-base
+
